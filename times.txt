@@ -1,2 +1,3 @@
-Serial: 0.000001
-OpenMP: 0.000007
+Serial: 0.000007
+OpenMP: 0.000762
+Pthreads 1: 0.005269
