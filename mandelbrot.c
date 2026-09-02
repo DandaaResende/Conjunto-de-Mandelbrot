@@ -9,7 +9,6 @@
 #define IMAG_MIN -1.5
 #define IMAG_MAX 1.5
 
-// Estrutura de dados para passar argumentos para as threads do Pthreads
 typedef struct {
     int id_thread;
     int num_threads;
@@ -78,6 +77,27 @@ int validar_argumentos(int argc, char *argv[],
     return 1;
 }
 
+// 1. SERIAL
+void executar_serial(int largura, int altura, int max_iteracoes, int *imagem, double *tempo_out) {
+    struct timespec inicio, fim;
+    clock_gettime(CLOCK_MONOTONIC, &inicio);
+
+    for (int y = 0; y < altura; y++) {
+        double c_imag = IMAG_MAX - (double)y / altura * (IMAG_MAX - IMAG_MIN);
+
+        for (int x = 0; x < largura; x++) {
+            double c_real = REAL_MIN + (double)x / largura * (REAL_MAX - REAL_MIN);
+
+            int iteracoes = calcular_pixel(c_real, c_imag, max_iteracoes);
+            imagem[y * largura + x] = (iteracoes * 255) / max_iteracoes;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &fim);
+    *tempo_out = (fim.tv_sec - inicio.tv_sec) + (fim.tv_nsec - inicio.tv_nsec) / 1e9;
+}
+
+// 2. OPENMP
 void executar_openmp(int largura, int altura, int max_iteracoes, int num_threads, int *imagem, double *tempo_out) {
     omp_set_num_threads(num_threads);
 
@@ -99,9 +119,7 @@ void executar_openmp(int largura, int altura, int max_iteracoes, int num_threads
     *tempo_out = fim - inicio;
 }
 
-// =============================================================================
-// PTHREADS 1: Divisão por Blocos Contíguos
-// =============================================================================
+// 3. PTHREADS 1: Divisão em Blocos Contíguos
 void *worker_pthreads1(void *arg) {
     ThreadData *data = (ThreadData *)arg;
 
@@ -128,10 +146,7 @@ int executar_pthreads1(int largura, int altura, int max_iteracoes, int num_threa
     ThreadData *data = malloc(num_threads * sizeof(ThreadData));
 
     if (!threads || !data) {
-        fprintf(stderr, "Erro: falha na alocacao de memoria para pthreads.\n");
-        free(threads);
-        free(data);
-        return 0;
+        free(threads); free(data); return 0;
     }
 
     struct timespec inicio, fim;
@@ -146,10 +161,7 @@ int executar_pthreads1(int largura, int altura, int max_iteracoes, int num_threa
         data[i].imagem = imagem;
 
         if (pthread_create(&threads[i], NULL, worker_pthreads1, &data[i]) != 0) {
-            fprintf(stderr, "Erro: falha ao criar thread do Pthreads 1.\n");
-            free(threads);
-            free(data);
-            return 0;
+            free(threads); free(data); return 0;
         }
     }
 
@@ -160,8 +172,60 @@ int executar_pthreads1(int largura, int altura, int max_iteracoes, int num_threa
     clock_gettime(CLOCK_MONOTONIC, &fim);
     *tempo_out = (fim.tv_sec - inicio.tv_sec) + (fim.tv_nsec - inicio.tv_nsec) / 1e9;
 
-    free(threads);
-    free(data);
+    free(threads); free(data);
+    return 1;
+}
+
+// 4. PTHREADS 2: Divisão Intercalada (Round-Robin)
+void *worker_pthreads2(void *arg) {
+    ThreadData *data = (ThreadData *)arg;
+
+    for (int y = data->id_thread; y < data->altura; y += data->num_threads) {
+        double c_imag = IMAG_MAX - (double)y / data->altura * (IMAG_MAX - IMAG_MIN);
+
+        for (int x = 0; x < data->largura; x++) {
+            double c_real = REAL_MIN + (double)x / data->largura * (REAL_MAX - REAL_MIN);
+
+            int iteracoes = calcular_pixel(c_real, c_imag, data->max_iteracoes);
+            data->imagem[y * data->largura + x] = (iteracoes * 255) / data->max_iteracoes;
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+int executar_pthreads2(int largura, int altura, int max_iteracoes, int num_threads, int *imagem, double *tempo_out) {
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    ThreadData *data = malloc(num_threads * sizeof(ThreadData));
+
+    if (!threads || !data) {
+        free(threads); free(data); return 0;
+    }
+
+    struct timespec inicio, fim;
+    clock_gettime(CLOCK_MONOTONIC, &inicio);
+
+    for (int i = 0; i < num_threads; i++) {
+        data[i].id_thread = i;
+        data[i].num_threads = num_threads;
+        data[i].largura = largura;
+        data[i].altura = altura;
+        data[i].max_iteracoes = max_iteracoes;
+        data[i].imagem = imagem;
+
+        if (pthread_create(&threads[i], NULL, worker_pthreads2, &data[i]) != 0) {
+            free(threads); free(data); return 0;
+        }
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &fim);
+    *tempo_out = (fim.tv_sec - inicio.tv_sec) + (fim.tv_nsec - inicio.tv_nsec) / 1e9;
+
+    free(threads); free(data);
     return 1;
 }
 
@@ -189,93 +253,46 @@ int salvar_imagem(const char *nome_arquivo, int *imagem, int largura, int altura
 }
 
 int main(int argc, char *argv[]) {
-    int largura;
-    int altura;
-    int max_iteracoes;
-    int num_threads;
+    int largura, altura, max_iteracoes, num_threads;
 
-    if (!validar_argumentos(argc, argv,
-                            &largura, &altura,
-                            &max_iteracoes, &num_threads)) {
+    if (!validar_argumentos(argc, argv, &largura, &altura, &max_iteracoes, &num_threads)) {
         return EXIT_FAILURE;
     }
 
     int *imagem = malloc((size_t)largura * altura * sizeof(int));
-
     if (imagem == NULL) {
         fprintf(stderr, "Erro: falha na alocacao de memoria.\n");
         return EXIT_FAILURE;
     }
 
-    // ==========================================
-    // 1. EXECUÇÃO SERIAL
-    // ==========================================
-    struct timespec inicio_s, fim_s;
-    clock_gettime(CLOCK_MONOTONIC, &inicio_s);
+    double tempo_serial = 0.0, tempo_openmp = 0.0, tempo_pthreads1 = 0.0, tempo_pthreads2 = 0.0;
 
-    for (int y = 0; y < altura; y++) {
-        double c_imag = IMAG_MAX - (double)y / altura * (IMAG_MAX - IMAG_MIN);
+    // 1. SERIAL
+    executar_serial(largura, altura, max_iteracoes, imagem, &tempo_serial);
+    salvar_imagem("mandelbrot_dmsrb_serial.pgm", imagem, largura, altura);
 
-        for (int x = 0; x < largura; x++) {
-            double c_real = REAL_MIN + (double)x / largura * (REAL_MAX - REAL_MIN);
-
-            int iteracoes = calcular_pixel(c_real, c_imag, max_iteracoes);
-
-            imagem[y * largura + x] = (iteracoes * 255) / max_iteracoes;
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &fim_s);
-    double tempo_serial = (fim_s.tv_sec - inicio_s.tv_sec) + 
-                         (fim_s.tv_nsec - inicio_s.tv_nsec) / 1e9;
-
-    if (!salvar_imagem("mandelbrot_dmsrb_serial.pgm", imagem, largura, altura)) {
-        free(imagem);
-        return EXIT_FAILURE;
-    }
-
-    // ==========================================
-    // 2. EXECUÇÃO OPENMP
-    // ==========================================
-    double tempo_openmp = 0.0;
+    // 2. OPENMP
     executar_openmp(largura, altura, max_iteracoes, num_threads, imagem, &tempo_openmp);
+    salvar_imagem("mandelbrot_dmsrb_openmp.pgm", imagem, largura, altura);
 
-    if (!salvar_imagem("mandelbrot_dmsrb_openmp.pgm", imagem, largura, altura)) {
-        free(imagem);
-        return EXIT_FAILURE;
-    }
+    // 3. PTHREADS 1
+    executar_pthreads1(largura, altura, max_iteracoes, num_threads, imagem, &tempo_pthreads1);
+    salvar_imagem("mandelbrot_dmsrb_pthreads1.pgm", imagem, largura, altura);
 
-    // ==========================================
-    // 3. EXECUÇÃO PTHREADS 1 (Blocos Contíguos)
-    // ==========================================
-    double tempo_pthreads1 = 0.0;
-    if (!executar_pthreads1(largura, altura, max_iteracoes, num_threads, imagem, &tempo_pthreads1)) {
-        free(imagem);
-        return EXIT_FAILURE;
-    }
+    // 4. PTHREADS 2
+    executar_pthreads2(largura, altura, max_iteracoes, num_threads, imagem, &tempo_pthreads2);
+    salvar_imagem("mandelbrot_dmsrb_pthreads2.pgm", imagem, largura, altura);
 
-    if (!salvar_imagem("mandelbrot_dmsrb_pthreads1.pgm", imagem, largura, altura)) {
-        free(imagem);
-        return EXIT_FAILURE;
-    }
-
-    // ==========================================
     // REGISTRO DOS TEMPOS
-    // ==========================================
     FILE *arquivo_tempo = fopen("times.txt", "w");
-
-    if (arquivo_tempo == NULL) {
-        fprintf(stderr, "Erro: falha ao criar times.txt.\n");
-        free(imagem);
-        return EXIT_FAILURE;
+    if (arquivo_tempo != NULL) {
+        fprintf(arquivo_tempo, "Serial: %.6f\n", tempo_serial);
+        fprintf(arquivo_tempo, "OpenMP: %.6f\n", tempo_openmp);
+        fprintf(arquivo_tempo, "Pthreads 1: %.6f\n", tempo_pthreads1);
+        fprintf(arquivo_tempo, "Pthreads 2: %.6f\n", tempo_pthreads2);
+        fclose(arquivo_tempo);
     }
 
-    fprintf(arquivo_tempo, "Serial: %.6f\n", tempo_serial);
-    fprintf(arquivo_tempo, "OpenMP: %.6f\n", tempo_openmp);
-    fprintf(arquivo_tempo, "Pthreads 1: %.6f\n", tempo_pthreads1);
-
-    fclose(arquivo_tempo);
     free(imagem);
-
     return EXIT_SUCCESS;
 }
